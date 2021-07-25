@@ -8,9 +8,9 @@ use fuse::{
     ReplyWrite, Request,
 };
 use libc::{EACCES, ENOENT};
-use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
+use std::{collections::HashMap, str::FromStr};
 use time::Timespec;
 
 const TTL: Timespec = Timespec { sec: 1, nsec: 0 };
@@ -105,7 +105,7 @@ impl Filesystem for MemFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         for (_, f) in self.inodes.iter() {
             if f.parent_ino == parent && name.to_str().unwrap() == f.name.as_str() {
-                reply.entry(&TTL, &f.attr, 0);
+                reply.entry(&TTL, &f.attr, f.generation);
                 return;
             }
         }
@@ -229,9 +229,22 @@ impl Filesystem for MemFS {
         _size: u32,
         reply: ReplyData,
     ) {
-        match self.datas.get(&ino) {
-            Some(x) => reply.data(x.as_bytes()),
-            None => reply.error(EACCES),
+        match self.inodes.get(&ino) {
+            Some(&File {
+                attr:
+                    FileAttr {
+                        kind: FileType::RegularFile,
+                        ..
+                    },
+                ..
+            }) => match self.datas.get(&ino) {
+                Some(x) => reply.data(x.as_bytes()),
+                None => reply.data(&[]),
+            },
+            _ => {
+                reply.error(EACCES);
+                return;
+            }
         }
     }
 
@@ -249,6 +262,53 @@ impl Filesystem for MemFS {
 
     fn rmdir(&mut self, _req: &Request, _parent: u64, _name: &OsStr, reply: fuse::ReplyEmpty) {
         self.unlink(_req, _parent, _name, reply)
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &Request,
+        _parent: u64,
+        _name: &OsStr,
+        _link: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let inode = time::now().to_timespec().sec as u64;
+        let f = new_file_attr(inode, 0, FileType::Symlink, _req.uid(), _req.gid());
+        self.inodes.insert(
+            inode,
+            File {
+                parent_ino: _parent,
+                name: _name.to_str().unwrap().to_string(),
+                attr: f,
+                generation: 0,
+            },
+        );
+        let x = String::from_str(_link.to_str().unwrap()).expect("fail to-string");
+        self.datas.insert(inode, x);
+        reply.entry(&TTL, &f, 0);
+    }
+
+    fn readlink(&mut self, _req: &Request, _ino: u64, reply: ReplyData) {
+        match self.inodes.get(&_ino) {
+            Some(&File {
+                attr:
+                    FileAttr {
+                        kind: FileType::Symlink,
+                        ..
+                    },
+                ..
+            }) => match self.datas.get(&_ino) {
+                Some(x) => reply.data(x.as_bytes()),
+                None => {
+                    reply.error(EACCES);
+                    return;
+                }
+            },
+            _ => {
+                reply.error(EACCES);
+                return;
+            }
+        }
     }
 }
 
